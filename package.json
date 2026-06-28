@@ -1,0 +1,10 @@
+{
+  "name": "bixo-en-or",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Site de acompanhamento dos desafios da competicao BIXO EN OR.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check app.js && node --check server.js"
+  }
+}
