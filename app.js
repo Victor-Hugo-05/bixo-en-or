@@ -224,11 +224,14 @@ const RAW_CHALLENGES = `,BRASIL,PONTOS,DESCRIÇÃO
 15,Tomar uma chuva torrencial na cabeça,10,(+10 se perder algum dispositivo eletrônico)`;
 
 const STORAGE_KEY = "bixo-en-or-state-v1";
+const COMMISSION_PASSWORD = "vhpatodovicente";
 const DEFAULT_BIXOS = ["Bixo 1", "Bixo 2", "Bixo 3", "Bixo 4"];
+const MAX_STORED_PROOF_BYTES = 1_200_000;
 
 const state = loadState();
-const challenges = parseChallenges(RAW_CHALLENGES);
+const baseChallenges = parseChallenges(RAW_CHALLENGES);
 const app = document.querySelector("#app");
+normalizeState();
 
 function parseCsvLine(line) {
   const cells = [];
@@ -335,31 +338,74 @@ function loadState() {
     }
   }
 
-  return {
+      return {
     role: "",
+    commissionUnlocked: false,
+    loginError: "",
     currentBixo: DEFAULT_BIXOS[0],
     bixos: DEFAULT_BIXOS,
+    bixoPasswords: {},
     checks: {},
+    submissions: [],
+    customChallenges: [],
+    challengeEdits: {},
+    editingChallengeId: "",
+    showBixoManager: false,
     query: "",
     category: "Todos",
     status: "Todos",
   };
 }
 
+function normalizeState() {
+  state.bixos ||= DEFAULT_BIXOS;
+  state.bixoPasswords ||= {};
+  state.checks ||= {};
+  state.submissions ||= [];
+  state.customChallenges ||= [];
+  state.challengeEdits ||= {};
+  state.showBixoManager ||= false;
+  Object.values(state.checks).forEach((byBixo) => {
+    Object.values(byBixo).forEach((completion) => {
+      if (completion.proof?.dataUrl) completion.proof = proofMetadata(completion.proof);
+    });
+  });
+  if (state.role === "Comissão" && state.commissionUnlocked !== true) state.role = "";
+  state.currentBixo ||= state.bixos[0] || DEFAULT_BIXOS[0];
+  state.category ||= "Todos";
+  state.status ||= "Todos";
+  if (state.role === "Bixo" && isSecretCategorySelected()) state.category = "Todos";
+}
+
 function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  normalizeState();
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (error) {
+    stripStoredProofData();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    state.loginError = "O navegador ficou sem espaço para salvar provas grandes. Mantive os registros, mas removi arquivos embutidos antigos.";
+  }
 }
 
 function getCompletion(challengeId, bixo) {
-  return Boolean(state.checks[challengeId]?.[bixo]);
+  return state.checks[challengeId]?.[bixo] || null;
 }
 
-function setCompletion(challengeId, bixo, value) {
+function isCompleted(challengeId, bixo) {
+  return Boolean(getCompletion(challengeId, bixo));
+}
+
+function setCompletion(challengeId, bixo, value, details = {}) {
   if (!state.checks[challengeId]) state.checks[challengeId] = {};
   if (value) {
     state.checks[challengeId][bixo] = {
-      at: new Date().toISOString(),
+      quantity: Math.max(1, Number(details.quantity || 1)),
+      bonus: Number(details.bonus || 0),
+      at: details.at || new Date().toISOString(),
       by: "Comissão",
+      proof: details.proof ? proofMetadata(details.proof) : null,
+      submissionId: details.submissionId || "",
     };
   } else {
     delete state.checks[challengeId][bixo];
@@ -369,23 +415,23 @@ function setCompletion(challengeId, bixo, value) {
 }
 
 function scoreFor(bixo) {
-  return challenges.reduce((sum, challenge) => {
-    return sum + (getCompletion(challenge.id, bixo) ? challenge.points : 0);
+  return challengesForScore().reduce((sum, challenge) => {
+    return sum + pointsForCompletion(challenge, getCompletion(challenge.id, bixo));
   }, 0);
 }
 
 function completionsFor(bixo) {
-  return challenges.filter((challenge) => getCompletion(challenge.id, bixo)).length;
+  return challengesForScore().filter((challenge) => isCompleted(challenge.id, bixo)).length;
 }
 
 function categories() {
-  return ["Todos", ...Array.from(new Set(challenges.map((challenge) => challenge.category)))];
+  return ["Todos", ...Array.from(new Set(visibleChallenges().map((challenge) => challenge.category)))];
 }
 
 function filteredChallenges() {
   const query = state.query.trim().toLowerCase();
-  return challenges.filter((challenge) => {
-    const checked = getCompletion(challenge.id, state.currentBixo);
+  return visibleChallenges().filter((challenge) => {
+    const checked = isCompleted(challenge.id, state.currentBixo);
     const haystack = [challenge.title, challenge.description, challenge.category, challenge.owner].join(" ").toLowerCase();
     return (
       (state.category === "Todos" || challenge.category === state.category) &&
@@ -395,14 +441,238 @@ function filteredChallenges() {
   });
 }
 
+function allChallenges() {
+  normalizeState();
+  const edited = baseChallenges.map((challenge) => ({
+    ...challenge,
+    ...(state.challengeEdits[challenge.id] || {}),
+  }));
+  return [...edited, ...state.customChallenges];
+}
+
+function isSecretChallenge(challenge) {
+  return challenge.category === "Bônus e Penalidades";
+}
+
+function isSecretCategorySelected() {
+  return state.category === "Bônus e Penalidades";
+}
+
+function visibleChallenges() {
+  const challenges = allChallenges();
+  if (state.role === "Bixo") return challenges.filter((challenge) => !isSecretChallenge(challenge));
+  return challenges;
+}
+
+function challengesForScore() {
+  if (state.role === "Bixo") return visibleChallenges();
+  return allChallenges();
+}
+
+function getChallenge(id) {
+  return allChallenges().find((challenge) => challenge.id === id);
+}
+
+function getMaxPoints(challenge) {
+  const text = `${challenge.title} ${challenge.description}`;
+  const match = text.match(/max\s*:?\s*(-?\d+)/i);
+  return match ? Number(match[1]) : null;
+}
+
+function supportsQuantity(challenge) {
+  return /\bpor\b|cada|a cada|max\s*:?|\bunidade\b|\bpacote\b|\bgarrafa\b|\bminuto\b/i.test(
+    `${challenge.title} ${challenge.description}`,
+  );
+}
+
+function supportsBonus(challenge) {
+  return /\+\s*\d+|bônus|bonus|extra/i.test(`${challenge.title} ${challenge.description}`);
+}
+
+function pointsForCompletion(challenge, completion) {
+  if (!completion) return 0;
+  const quantity = Math.max(1, Number(completion.quantity || 1));
+  const bonus = Number(completion.bonus || 0);
+  const raw = challenge.points * quantity + bonus;
+  const max = getMaxPoints(challenge);
+  return max === null ? raw : Math.min(raw, max);
+}
+
+function getBixoPassword(bixo) {
+  return state.bixoPasswords?.[bixo] || "";
+}
+
+function setBixoPassword(bixo, password) {
+  state.bixoPasswords[bixo] = password;
+}
+
+function renameBixo(oldName, newName, password) {
+  const cleanName = newName.trim();
+  if (!cleanName || (cleanName !== oldName && state.bixos.includes(cleanName))) return false;
+
+  state.bixos = state.bixos.map((bixo) => (bixo === oldName ? cleanName : bixo));
+  if (oldName !== cleanName) {
+    Object.values(state.checks).forEach((byBixo) => {
+      if (Object.prototype.hasOwnProperty.call(byBixo, oldName)) {
+        byBixo[cleanName] = byBixo[oldName];
+        delete byBixo[oldName];
+      }
+    });
+    state.submissions.forEach((submission) => {
+      if (submission.bixo === oldName) submission.bixo = cleanName;
+    });
+    delete state.bixoPasswords[oldName];
+  }
+  setBixoPassword(cleanName, password);
+  if (state.currentBixo === oldName) state.currentBixo = cleanName;
+  return true;
+}
+
+function deleteBixo(name) {
+  if (state.bixos.length <= 1) return false;
+  state.bixos = state.bixos.filter((bixo) => bixo !== name);
+  delete state.bixoPasswords[name];
+  Object.values(state.checks).forEach((byBixo) => delete byBixo[name]);
+  state.submissions = state.submissions.filter((submission) => submission.bixo !== name);
+  if (state.currentBixo === name) state.currentBixo = state.bixos[0];
+  return true;
+}
+
+function pendingSubmissions() {
+  return state.submissions.filter((submission) => submission.status === "Sob análise");
+}
+
+function submissionsForCurrentBixo() {
+  return state.submissions
+    .filter((submission) => submission.bixo === state.currentBixo)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function formatDate(value) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "2-digit" }).format(new Date(value));
+}
+
+function proofMetadata(proof) {
+  if (!proof) return null;
+  return {
+    name: proof.name || "prova",
+    type: proof.type || "",
+    size: Number(proof.size || 0),
+    stored: Boolean(proof.dataUrl),
+    tooLarge: Boolean(proof.tooLarge),
+  };
+}
+
+function stripStoredProofData() {
+  state.submissions = state.submissions.map((submission) => ({
+    ...submission,
+    proof: submission.proof ? proofMetadata({ ...submission.proof, dataUrl: "" }) : null,
+  }));
+
+  Object.values(state.checks).forEach((byBixo) => {
+    Object.values(byBixo).forEach((completion) => {
+      if (completion.proof) completion.proof = proofMetadata(completion.proof);
+    });
+  });
+}
+
+function scoreHistory() {
+  const events = [];
+  allChallenges().forEach((challenge) => {
+    Object.entries(state.checks[challenge.id] || {}).forEach(([bixo, completion]) => {
+      if (!completion?.at) return;
+      events.push({
+        bixo,
+        date: completion.at.slice(0, 10),
+        points: pointsForCompletion(challenge, completion),
+      });
+    });
+  });
+
+  const dates = Array.from(new Set(events.map((event) => event.date))).sort();
+  const series = state.bixos.map((bixo) => {
+    let total = 0;
+    return {
+      bixo,
+      values: dates.map((date) => {
+        total += events
+          .filter((event) => event.bixo === bixo && event.date === date)
+          .reduce((sum, event) => sum + event.points, 0);
+        return total;
+      }),
+    };
+  });
+
+  return { dates, series };
+}
+
+function renderScoreChart() {
+  const { dates, series } = scoreHistory();
+  const visibleSeries = series.filter((item) => item.values.some((value) => value !== 0));
+  if (!dates.length || !visibleSeries.length) {
+    return `<div class="empty compact-empty">Sem dados por data ainda.</div>`;
+  }
+
+  const width = 640;
+  const height = 260;
+  const pad = 34;
+  const maxValue = Math.max(10, ...visibleSeries.flatMap((item) => item.values));
+  const colors = ["#0e6f68", "#ba6b1f", "#4e5fa8", "#a8404d", "#4f7d35", "#8257a5"];
+  const xFor = (index) => (dates.length === 1 ? width / 2 : pad + (index * (width - pad * 2)) / (dates.length - 1));
+  const yFor = (value) => height - pad - (value * (height - pad * 2)) / maxValue;
+
+  return `
+    <div class="chart-wrap">
+      <svg class="score-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Pontuação por data">
+        <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" />
+        <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" />
+        ${[0, 0.5, 1].map((ratio) => {
+          const y = yFor(maxValue * ratio);
+          return `<g><line class="gridline" x1="${pad}" y1="${y}" x2="${width - pad}" y2="${y}" /><text x="6" y="${y + 4}">${Math.round(maxValue * ratio)}</text></g>`;
+        }).join("")}
+        ${visibleSeries.map((item, seriesIndex) => {
+          const color = colors[seriesIndex % colors.length];
+          const points = item.values.map((value, index) => `${xFor(index)},${yFor(value)}`).join(" ");
+          return `
+            <polyline points="${points}" stroke="${color}" />
+            ${item.values.map((value, index) => `<circle cx="${xFor(index)}" cy="${yFor(value)}" r="3.5" fill="${color}" />`).join("")}
+          `;
+        }).join("")}
+        ${dates.map((date, index) => `<text class="date-label" x="${xFor(index)}" y="${height - 8}">${formatDate(date)}</text>`).join("")}
+      </svg>
+      <div class="chart-legend">
+        ${visibleSeries.map((item, index) => `<span><i style="background:${colors[index % colors.length]}"></i>${escapeHtml(item.bixo)}</span>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
 function renderLogin() {
   app.innerHTML = `
     <main class="login">
       <h1>BIXO EN OR</h1>
       <p>Escolha como você quer entrar agora. A Comissão valida os défis; bixo acompanha busca, progresso e placar.</p>
       <div class="login-grid">
-        <button class="primary" data-login="Comissão">Entrar como Comissão</button>
-        <button class="secondary" data-login="Bixo">Entrar como Bixo</button>
+        <form id="commission-login" class="login-grid">
+          <div class="field">
+            <label for="commission-password">Senha da Comissão</label>
+            <input id="commission-password" type="password" autocomplete="current-password" placeholder="Senha">
+          </div>
+          <button class="primary" type="submit">Entrar como Comissão</button>
+        </form>
+        <form id="bixo-login" class="login-grid">
+          <div class="field">
+            <label for="bixo-login-name">Entrar como bixo</label>
+            <input id="bixo-login-name" autocomplete="name" placeholder="Seu nome">
+          </div>
+          <div class="field">
+            <label for="bixo-login-password">Senha do bixo</label>
+            <input id="bixo-login-password" type="password" autocomplete="current-password" placeholder="Senha">
+          </div>
+          <button class="secondary" type="submit">Entrar como Bixo</button>
+        </form>
+        ${state.loginError ? `<div class="error">${escapeHtml(state.loginError)}</div>` : ""}
       </div>
     </main>
   `;
@@ -414,18 +684,62 @@ function renderLogin() {
       render();
     });
   });
+
+  app.querySelector("#bixo-login")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = app.querySelector("#bixo-login-name").value.trim();
+    const password = app.querySelector("#bixo-login-password").value;
+    if (!name) return;
+    if (!state.bixos.includes(name)) {
+      state.loginError = "Bixo não cadastrado pela Comissão.";
+      saveState();
+      render();
+      return;
+    }
+    if (password !== getBixoPassword(name)) {
+      state.loginError = "Senha do bixo incorreta.";
+      saveState();
+      render();
+      return;
+    }
+    state.currentBixo = name;
+    state.role = "Bixo";
+    state.loginError = "";
+    if (isSecretCategorySelected()) state.category = "Todos";
+    saveState();
+    render();
+  });
+
+  app.querySelector("#commission-login")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const password = app.querySelector("#commission-password").value;
+    if (password !== COMMISSION_PASSWORD) {
+      state.loginError = "Senha incorreta.";
+      saveState();
+      render();
+      return;
+    }
+    state.role = "Comissão";
+    state.commissionUnlocked = true;
+    state.loginError = "";
+    saveState();
+    render();
+  });
 }
 
-function render() {
+function render(options = {}) {
   if (!state.role) {
     renderLogin();
     return;
   }
 
+  if (state.role === "Bixo" && isSecretCategorySelected()) state.category = "Todos";
+
   const ranked = [...state.bixos]
     .map((bixo) => ({ bixo, score: scoreFor(bixo), done: completionsFor(bixo) }))
     .sort((a, b) => b.score - a.score || b.done - a.done || a.bixo.localeCompare(b.bixo));
 
+  const challengeCount = visibleChallenges().length;
   const list = filteredChallenges();
   app.innerHTML = `
     <div class="shell">
@@ -434,7 +748,7 @@ function render() {
           <div class="brand-mark">BO</div>
           <div>
             <h1>BIXO EN OR</h1>
-            <p>${challenges.length} défis carregados da planilha</p>
+            <p>${challengeCount} défis carregados da planilha</p>
           </div>
         </div>
         <div class="role-switch" aria-label="Nível de acesso">
@@ -442,34 +756,14 @@ function render() {
           <button class="${state.role === "Bixo" ? "active" : ""}" data-role="Bixo">Bixo</button>
         </div>
       </header>
+      ${state.role === "Comissão" && state.showBixoManager ? renderBixoManager() : ""}
       <main class="main">
         <aside class="sidebar">
-          <section class="panel">
-            <h2>Placar</h2>
-            <div class="score-list">
-              ${ranked.map((row, index) => `
-                <div class="score-row">
-                  <div class="rank">${index + 1}</div>
-                  <div>
-                    <div class="score-name">${escapeHtml(row.bixo)}</div>
-                    <div class="score-meta">${row.done} défis validados</div>
-                  </div>
-                  <div class="score-points">${row.score}</div>
-                </div>
-              `).join("")}
-            </div>
-          </section>
-          <section class="panel">
-            <h3>Bixo selecionado</h3>
-            <div class="bixo-list">
-              ${state.bixos.map((bixo) => `
-                <button class="chip ${bixo === state.currentBixo ? "active" : ""}" data-bixo="${escapeAttr(bixo)}">${escapeHtml(bixo)}</button>
-              `).join("")}
-            </div>
-          </section>
+          ${state.role === "Comissão" ? renderCommissionSidebar(ranked) : renderBixoSidebar()}
           ${state.role === "Comissão" ? renderAdminTools() : ""}
         </aside>
         <section>
+          ${state.role === "Comissão" ? renderCommissionOverview() : renderBixoSubmissions()}
           <div class="controls">
             <div class="field">
               <label for="search">Procurar défi</label>
@@ -495,6 +789,84 @@ function render() {
   `;
 
   bindEvents();
+  restoreFocus(options);
+}
+
+function renderCommissionOverview() {
+  return `
+    <section class="dashboard-band">
+      <div class="panel chart-panel">
+        <div class="section-head">
+          <h2>Evolução dos pontos</h2>
+          <span class="muted">por data de validação</span>
+        </div>
+        ${renderScoreChart()}
+      </div>
+      <div class="panel review-panel">
+        <div class="section-head">
+          <h2>Sob análise</h2>
+          <span class="pill">${pendingSubmissions().length}</span>
+        </div>
+        ${renderPendingSubmissions()}
+      </div>
+    </section>
+  `;
+}
+
+function renderBixoSubmissions() {
+  const submissions = submissionsForCurrentBixo();
+  if (!submissions.length) return "";
+  return `
+    <section class="panel submissions-strip">
+      <h2>Minhas solicitações</h2>
+      <div class="submission-list">
+        ${submissions.slice(0, 3).map((submission) => `
+          <div class="submission-row">
+            <div>
+              <strong>${escapeHtml(submission.title)}</strong>
+              <span>${escapeHtml(submission.status)} · ${formatDate(submission.createdAt)}</span>
+            </div>
+            <span class="points">${submission.points > 0 ? "+" : ""}${submission.points} pts</span>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderPendingSubmissions() {
+  const submissions = pendingSubmissions();
+  if (!submissions.length) return `<div class="empty compact-empty">Nenhuma solicitação pendente.</div>`;
+
+  return `
+    <div class="submission-list">
+      ${submissions.map((submission) => `
+        <article class="submission-row review-row">
+          <div>
+            <strong>${escapeHtml(submission.title)}</strong>
+            <span>${escapeHtml(submission.bixo)} · ${formatDate(submission.createdAt)} · ${submission.points > 0 ? "+" : ""}${submission.points} pts</span>
+            ${submission.note ? `<p>${escapeHtml(submission.note)}</p>` : ""}
+            ${renderProofLink(submission.proof)}
+          </div>
+          <div class="actions">
+            <button class="primary" data-approve-submission="${submission.id}">Aprovar</button>
+            <button class="danger" data-reject-submission="${submission.id}">Recusar</button>
+          </div>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderProofLink(proof) {
+  if (!proof) return `<span>Sem arquivo de prova anexado</span>`;
+  if (proof.dataUrl) {
+    return `<a href="${proof.dataUrl}" download="${escapeAttr(proof.name)}">Baixar prova</a>`;
+  }
+  if (proof.tooLarge) {
+    return `<span>Prova grande demais para salvar neste protótipo local: ${escapeHtml(proof.name)}</span>`;
+  }
+  return `<span>Arquivo registrado: ${escapeHtml(proof.name)}</span>`;
 }
 
 function renderAdminTools() {
@@ -505,33 +877,246 @@ function renderAdminTools() {
         <label for="new-bixo">Adicionar bixo</label>
         <input id="new-bixo" placeholder="Nome do bixo">
       </div>
+      <div class="field">
+        <label for="new-bixo-password">Senha inicial</label>
+        <input id="new-bixo-password" type="text" placeholder="Senha do bixo">
+      </div>
       <button class="secondary" id="add-bixo">Adicionar</button>
+      <form id="add-challenge-form" class="admin-form">
+        <h3>Novo défi</h3>
+        <div class="field">
+          <label for="new-title">Título</label>
+          <input id="new-title" required placeholder="Ex: Fazer brigadeiro">
+        </div>
+        <div class="field">
+          <label for="new-category">Categoria</label>
+          <input id="new-category" required list="category-options" placeholder="Ex: FRANÇA">
+        </div>
+        <div class="field">
+          <label for="new-owner">Vet / grupo</label>
+          <input id="new-owner" placeholder="Opcional">
+        </div>
+        <div class="field">
+          <label for="new-points">Pontos base</label>
+          <input id="new-points" type="number" required value="10">
+        </div>
+        <div class="field">
+          <label for="new-description">Descrição</label>
+          <textarea id="new-description" rows="3" placeholder="Regras, bônus, máximo..."></textarea>
+        </div>
+        <button class="primary" type="submit">Adicionar défi</button>
+      </form>
       <button class="danger" id="reset-data">Zerar validações</button>
+    </section>
+    <datalist id="category-options">
+      ${categories().filter((category) => category !== "Todos").map((category) => `<option value="${escapeAttr(category)}"></option>`).join("")}
+    </datalist>
+  `;
+}
+
+function renderCommissionSidebar(ranked) {
+  return `
+    <section class="panel">
+      <h2>Placar</h2>
+      <div class="score-list">
+        ${ranked.map((row, index) => `
+          <div class="score-row">
+            <div class="rank">${index + 1}</div>
+            <div>
+              <div class="score-name">${escapeHtml(row.bixo)}</div>
+              <div class="score-meta">${row.done} défis validados</div>
+            </div>
+            <div class="score-points">${row.score}</div>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+    <section class="panel">
+      <h3>Bixo selecionado</h3>
+      <div class="bixo-list">
+        ${state.bixos.map((bixo) => `
+          <button class="chip ${bixo === state.currentBixo ? "active" : ""}" data-bixo="${escapeAttr(bixo)}">${escapeHtml(bixo)}</button>
+        `).join("")}
+      </div>
+      <button class="secondary full-button" id="open-bixo-manager">Gerenciar bixos</button>
+    </section>
+  `;
+}
+
+function renderBixoManager() {
+  return `
+    <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="bixo-manager-title">
+      <section class="modal">
+        <div class="section-head">
+          <div>
+            <h2 id="bixo-manager-title">Gerenciar bixos</h2>
+            <span class="muted">Renomeie, troque senhas ou remova perfis.</span>
+          </div>
+          <button class="secondary icon-button" id="close-bixo-manager" aria-label="Fechar">×</button>
+        </div>
+        <div class="manager-list">
+          ${state.bixos.map((bixo) => `
+            <form class="manager-row" data-bixo-manager="${escapeAttr(bixo)}">
+              <div class="field">
+                <label>Nome</label>
+                <input name="name" value="${escapeAttr(bixo)}" required>
+              </div>
+              <div class="field">
+                <label>Senha</label>
+                <input name="password" value="${escapeAttr(getBixoPassword(bixo))}" placeholder="Senha">
+              </div>
+              <div class="manager-actions">
+                <button class="primary" type="submit">Salvar</button>
+                <button class="danger" type="button" data-delete-bixo="${escapeAttr(bixo)}">Excluir</button>
+              </div>
+            </form>
+          `).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderBixoSidebar() {
+  const score = scoreFor(state.currentBixo);
+  const done = completionsFor(state.currentBixo);
+  return `
+    <section class="panel own-progress">
+      <h2>Meu progresso</h2>
+      <div class="own-score">${score}</div>
+      <div class="score-meta">pontos públicos</div>
+      <div class="own-divider"></div>
+      <div class="score-name">${escapeHtml(state.currentBixo)}</div>
+      <div class="score-meta">${done} défis públicos validados</div>
     </section>
   `;
 }
 
 function renderChallenge(challenge) {
-  const checked = getCompletion(challenge.id, state.currentBixo);
+  const completion = getCompletion(challenge.id, state.currentBixo);
+  const checked = Boolean(completion);
   const canEdit = state.role === "Comissão";
+  const quantity = Math.max(1, Number(completion?.quantity || 1));
+  const bonus = Number(completion?.bonus || 0);
+  const max = getMaxPoints(challenge);
+  const total = pointsForCompletion(challenge, completion);
+
+  if (state.editingChallengeId === challenge.id) {
+    return renderChallengeForm(challenge);
+  }
+
   return `
     <article class="challenge ${checked ? "done" : ""}">
       <div class="challenge-head">
         <span class="tag">${escapeHtml(challenge.category)}${challenge.owner ? ` · ${escapeHtml(challenge.owner)}` : ""}</span>
-        <span class="points">${challenge.points > 0 ? "+" : ""}${challenge.points} pts</span>
+        <span class="points">${challenge.points > 0 ? "+" : ""}${challenge.points} pts${max !== null ? ` · max ${max}` : ""}</span>
       </div>
       <div>
         <h3>${escapeHtml(challenge.title)}</h3>
         ${challenge.description ? `<p>${escapeHtml(challenge.description)}</p>` : ""}
       </div>
+      ${canEdit ? `
+        <div class="check-tools">
+          ${supportsQuantity(challenge) ? `
+            <div class="field compact">
+              <label for="qty-${challenge.id}">Quantidade</label>
+              <input id="qty-${challenge.id}" data-quantity="${challenge.id}" type="number" min="1" step="1" value="${quantity}">
+            </div>
+          ` : ""}
+          ${supportsBonus(challenge) ? `
+            <div class="field compact">
+              <label for="bonus-${challenge.id}">Bônus</label>
+              <input id="bonus-${challenge.id}" data-bonus="${challenge.id}" type="number" step="1" value="${bonus}">
+            </div>
+          ` : ""}
+        </div>
+      ` : renderSubmissionDetails(challenge)}
       <div class="actions">
         ${canEdit ? `
           <button class="${checked ? "danger" : "primary"}" data-toggle="${challenge.id}">
             ${checked ? "Remover check" : "Dar check"}
           </button>
+          <button class="secondary" data-edit="${challenge.id}">Editar défi</button>
         ` : ""}
-        <span class="${checked ? "status" : "muted"}">${checked ? `Validado para ${escapeHtml(state.currentBixo)}` : "Ainda aberto"}</span>
+        <span class="${checked ? "status" : "muted"}">${checked ? `Validado para ${escapeHtml(state.currentBixo)}: ${total} pts` : "Ainda aberto"}</span>
       </div>
+    </article>
+  `;
+}
+
+function renderSubmissionDetails(challenge) {
+  const pending = state.submissions.find(
+    (submission) =>
+      submission.challengeId === challenge.id &&
+      submission.bixo === state.currentBixo &&
+      submission.status === "Sob análise",
+  );
+
+  if (pending) {
+    return `<div class="pending-note">Solicitação enviada em ${formatDate(pending.createdAt)} e aguardando análise.</div>`;
+  }
+
+  return `
+    <details class="proof-details">
+      <summary>Enviar prova para a Comissão</summary>
+      <form class="proof-form" data-proof-form="${challenge.id}">
+        <div class="check-tools">
+          ${supportsQuantity(challenge) ? `
+            <div class="field compact">
+              <label for="proof-qty-${challenge.id}">Quantidade</label>
+              <input id="proof-qty-${challenge.id}" name="quantity" type="number" min="1" step="1" value="1">
+            </div>
+          ` : ""}
+          ${supportsBonus(challenge) ? `
+            <div class="field compact">
+              <label for="proof-bonus-${challenge.id}">Bônus pedido</label>
+              <input id="proof-bonus-${challenge.id}" name="bonus" type="number" step="1" value="0">
+            </div>
+          ` : ""}
+        </div>
+        <div class="field">
+          <label for="proof-file-${challenge.id}">Prova</label>
+          <input id="proof-file-${challenge.id}" name="proof" type="file" accept="image/*,video/*">
+        </div>
+        <div class="field">
+          <label for="proof-note-${challenge.id}">Observação</label>
+          <textarea id="proof-note-${challenge.id}" name="note" rows="2" placeholder="Contexto para a Comissão"></textarea>
+        </div>
+        <button class="secondary" type="submit">Enviar solicitação</button>
+      </form>
+    </details>
+  `;
+}
+
+function renderChallengeForm(challenge) {
+  return `
+    <article class="challenge edit-card">
+      <form class="edit-form" data-edit-form="${challenge.id}">
+        <div class="field">
+          <label for="edit-title-${challenge.id}">Título</label>
+          <input id="edit-title-${challenge.id}" name="title" required value="${escapeAttr(challenge.title)}">
+        </div>
+        <div class="field">
+          <label for="edit-category-${challenge.id}">Categoria</label>
+          <input id="edit-category-${challenge.id}" name="category" required list="category-options" value="${escapeAttr(challenge.category)}">
+        </div>
+        <div class="field">
+          <label for="edit-owner-${challenge.id}">Vet / grupo</label>
+          <input id="edit-owner-${challenge.id}" name="owner" value="${escapeAttr(challenge.owner)}">
+        </div>
+        <div class="field">
+          <label for="edit-points-${challenge.id}">Pontos base</label>
+          <input id="edit-points-${challenge.id}" name="points" type="number" required value="${challenge.points}">
+        </div>
+        <div class="field">
+          <label for="edit-description-${challenge.id}">Descrição</label>
+          <textarea id="edit-description-${challenge.id}" name="description" rows="4">${escapeHtml(challenge.description)}</textarea>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit">Salvar</button>
+          <button class="secondary" type="button" data-cancel-edit>Cancelar</button>
+        </div>
+      </form>
     </article>
   `;
 }
@@ -539,6 +1124,13 @@ function renderChallenge(challenge) {
 function bindEvents() {
   app.querySelectorAll("[data-role]").forEach((button) => {
     button.addEventListener("click", () => {
+      if (button.dataset.role === "Comissão" && !state.commissionUnlocked) {
+        state.role = "";
+        state.loginError = "";
+        saveState();
+        render();
+        return;
+      }
       state.role = button.dataset.role;
       saveState();
       render();
@@ -553,10 +1145,52 @@ function bindEvents() {
     });
   });
 
-  app.querySelector("#search")?.addEventListener("input", (event) => {
-    state.query = event.target.value;
+  app.querySelector("#open-bixo-manager")?.addEventListener("click", () => {
+    state.showBixoManager = true;
     saveState();
     render();
+  });
+
+  app.querySelector("#close-bixo-manager")?.addEventListener("click", () => {
+    state.showBixoManager = false;
+    saveState();
+    render();
+  });
+
+  app.querySelector(".modal-backdrop")?.addEventListener("click", (event) => {
+    if (!event.target.classList.contains("modal-backdrop")) return;
+    state.showBixoManager = false;
+    saveState();
+    render();
+  });
+
+  app.querySelectorAll("[data-bixo-manager]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const oldName = form.dataset.bixoManager;
+      const data = new FormData(form);
+      renameBixo(oldName, String(data.get("name") || ""), String(data.get("password") || ""));
+      saveState();
+      render();
+    });
+  });
+
+  app.querySelectorAll("[data-delete-bixo]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const name = button.dataset.deleteBixo;
+      if (!confirm(`Excluir ${name} e apagar seus checks/solicitações?`)) return;
+      deleteBixo(name);
+      saveState();
+      render();
+    });
+  });
+
+  app.querySelector("#search")?.addEventListener("input", (event) => {
+    const selectionStart = event.target.selectionStart;
+    const selectionEnd = event.target.selectionEnd;
+    state.query = event.target.value;
+    saveState();
+    render({ focusId: "search", selectionStart, selectionEnd });
   });
 
   app.querySelector("#category")?.addEventListener("change", (event) => {
@@ -574,15 +1208,81 @@ function bindEvents() {
   app.querySelectorAll("[data-toggle]").forEach((button) => {
     button.addEventListener("click", () => {
       const id = button.dataset.toggle;
-      setCompletion(id, state.currentBixo, !getCompletion(id, state.currentBixo));
+      const challenge = getChallenge(id);
+      const quantityInput = app.querySelector(`[data-quantity="${cssEscape(id)}"]`);
+      const bonusInput = app.querySelector(`[data-bonus="${cssEscape(id)}"]`);
+      const details = {
+        quantity: quantityInput ? quantityInput.value : 1,
+        bonus: bonusInput ? bonusInput.value : 0,
+      };
+      setCompletion(id, state.currentBixo, !isCompleted(id, state.currentBixo), details);
+    });
+  });
+
+  app.querySelectorAll("[data-quantity], [data-bonus]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const id = input.dataset.quantity || input.dataset.bonus;
+      if (!isCompleted(id, state.currentBixo)) return;
+      const currentCompletion = getCompletion(id, state.currentBixo);
+      const quantityInput = app.querySelector(`[data-quantity="${cssEscape(id)}"]`);
+      const bonusInput = app.querySelector(`[data-bonus="${cssEscape(id)}"]`);
+      setCompletion(id, state.currentBixo, true, {
+        quantity: quantityInput ? quantityInput.value : currentCompletion?.quantity || 1,
+        bonus: bonusInput ? bonusInput.value : currentCompletion?.bonus || 0,
+        at: currentCompletion?.at,
+        proof: currentCompletion?.proof,
+        submissionId: currentCompletion?.submissionId,
+      });
+    });
+  });
+
+  app.querySelectorAll("[data-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.editingChallengeId = button.dataset.edit;
+      saveState();
+      render();
+    });
+  });
+
+  app.querySelectorAll("[data-cancel-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.editingChallengeId = "";
+      saveState();
+      render();
+    });
+  });
+
+  app.querySelectorAll("[data-edit-form]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const id = form.dataset.editForm;
+      const data = new FormData(form);
+      const patch = {
+        title: data.get("title").trim(),
+        category: data.get("category").trim(),
+        owner: data.get("owner").trim(),
+        points: Number(data.get("points") || 0),
+        description: data.get("description").trim(),
+      };
+      const customIndex = state.customChallenges.findIndex((challenge) => challenge.id === id);
+      if (customIndex >= 0) {
+        state.customChallenges[customIndex] = { ...state.customChallenges[customIndex], ...patch };
+      } else {
+        state.challengeEdits[id] = patch;
+      }
+      state.editingChallengeId = "";
+      saveState();
+      render();
     });
   });
 
   app.querySelector("#add-bixo")?.addEventListener("click", () => {
     const input = app.querySelector("#new-bixo");
+    const passwordInput = app.querySelector("#new-bixo-password");
     const name = input.value.trim();
     if (!name || state.bixos.includes(name)) return;
     state.bixos.push(name);
+    setBixoPassword(name, passwordInput.value);
     state.currentBixo = name;
     saveState();
     render();
@@ -594,6 +1294,131 @@ function bindEvents() {
     saveState();
     render();
   });
+
+  app.querySelector("#add-challenge-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const title = app.querySelector("#new-title").value.trim();
+    const category = app.querySelector("#new-category").value.trim();
+    const owner = app.querySelector("#new-owner").value.trim();
+    const points = Number(app.querySelector("#new-points").value || 0);
+    const description = app.querySelector("#new-description").value.trim();
+    if (!title || !category) return;
+
+    const challenge = {
+      id: `custom-${Date.now()}-${slug(title).slice(0, 36)}`,
+      category,
+      owner,
+      title,
+      points,
+      description,
+    };
+    state.customChallenges.push(challenge);
+    state.category = category;
+    state.editingChallengeId = "";
+    saveState();
+    render();
+  });
+
+  app.querySelectorAll("[data-proof-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const challenge = getChallenge(form.dataset.proofForm);
+      const data = new FormData(form);
+      const file = data.get("proof");
+      const proof = file && file.size ? await readProofFile(file) : null;
+      const quantity = Math.max(1, Number(data.get("quantity") || 1));
+      const bonus = Number(data.get("bonus") || 0);
+      const completion = { quantity, bonus, at: new Date().toISOString() };
+
+      state.submissions.push({
+        id: `submission-${Date.now()}-${slug(challenge.title).slice(0, 24)}`,
+        challengeId: challenge.id,
+        category: "Sob análise",
+        bixo: state.currentBixo,
+        title: challenge.title,
+        points: pointsForCompletion(challenge, completion),
+        quantity,
+        bonus,
+        note: String(data.get("note") || "").trim(),
+        proof,
+        status: "Sob análise",
+        createdAt: completion.at,
+        resolvedAt: "",
+      });
+      saveState();
+      render();
+    });
+  });
+
+  app.querySelectorAll("[data-approve-submission]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const submission = state.submissions.find((item) => item.id === button.dataset.approveSubmission);
+      if (!submission) return;
+      submission.status = "Aprovado";
+      submission.resolvedAt = new Date().toISOString();
+      setCompletion(submission.challengeId, submission.bixo, true, {
+        quantity: submission.quantity,
+        bonus: submission.bonus,
+        at: submission.resolvedAt,
+        proof: submission.proof,
+        submissionId: submission.id,
+      });
+    });
+  });
+
+  app.querySelectorAll("[data-reject-submission]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const submission = state.submissions.find((item) => item.id === button.dataset.rejectSubmission);
+      if (!submission) return;
+      submission.status = "Recusado";
+      submission.resolvedAt = new Date().toISOString();
+      saveState();
+      render();
+    });
+  });
+}
+
+function readProofFile(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > MAX_STORED_PROOF_BYTES) {
+      resolve({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        dataUrl: "",
+        tooLarge: true,
+      });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      resolve({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        dataUrl: reader.result,
+        tooLarge: false,
+      });
+    });
+    reader.addEventListener("error", () => reject(reader.error));
+    reader.readAsDataURL(file);
+  });
+}
+
+function restoreFocus(options) {
+  if (!options.focusId) return;
+  const element = app.querySelector(`#${cssEscape(options.focusId)}`);
+  if (!element) return;
+  element.focus();
+  if (typeof options.selectionStart === "number" && typeof element.setSelectionRange === "function") {
+    element.setSelectionRange(options.selectionStart, options.selectionEnd ?? options.selectionStart);
+  }
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return CSS.escape(value);
+  return String(value).replace(/["\\]/g, "\\$&");
 }
 
 function escapeHtml(value) {
