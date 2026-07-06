@@ -227,11 +227,15 @@ const STORAGE_KEY = "bixo-en-or-state-v1";
 const COMMISSION_PASSWORD = "vhpatodovicente";
 const DEFAULT_BIXOS = ["Bixo 1", "Bixo 2", "Bixo 3", "Bixo 4"];
 const MAX_STORED_PROOF_BYTES = 1_200_000;
+const CLOUD_CONFIG = window.BIXO_EN_OR_CONFIG || {};
+const CLOUD_ENABLED = Boolean(CLOUD_CONFIG.supabaseUrl && CLOUD_CONFIG.supabaseAnonKey && window.supabase);
+const cloudClient = CLOUD_ENABLED ? window.supabase.createClient(CLOUD_CONFIG.supabaseUrl, CLOUD_CONFIG.supabaseAnonKey) : null;
 
 const state = loadState();
 const baseChallenges = parseChallenges(RAW_CHALLENGES);
 const app = document.querySelector("#app");
 normalizeState();
+bootstrapCloud();
 
 function parseCsvLine(line) {
   const cells = [];
@@ -349,8 +353,11 @@ function loadState() {
     submissions: [],
     customChallenges: [],
     challengeEdits: {},
+    deletedChallengeIds: [],
+    visibleCategories: ["BRASIL"],
     editingChallengeId: "",
     showBixoManager: false,
+    showVisibilityManager: false,
     query: "",
     category: "Todos",
     status: "Todos",
@@ -364,7 +371,10 @@ function normalizeState() {
   state.submissions ||= [];
   state.customChallenges ||= [];
   state.challengeEdits ||= {};
+  state.deletedChallengeIds ||= [];
+  state.visibleCategories ||= ["BRASIL"];
   state.showBixoManager ||= false;
+  state.showVisibilityManager ||= false;
   Object.values(state.checks).forEach((byBixo) => {
     Object.values(byBixo).forEach((completion) => {
       if (completion.proof?.dataUrl) completion.proof = proofMetadata(completion.proof);
@@ -381,10 +391,62 @@ function saveState() {
   normalizeState();
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    createDailyBackup();
+    saveCloudState();
   } catch (error) {
     stripStoredProofData();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     state.loginError = "O navegador ficou sem espaço para salvar provas grandes. Mantive os registros, mas removi arquivos embutidos antigos.";
+  }
+}
+
+function createDailyBackup() {
+  const date = new Date().toISOString().slice(0, 10);
+  localStorage.setItem(`${STORAGE_KEY}-backup-${date}`, JSON.stringify({
+    createdAt: new Date().toISOString(),
+    state,
+  }));
+}
+
+async function bootstrapCloud() {
+  if (!CLOUD_ENABLED) {
+    render();
+    return;
+  }
+
+  try {
+    const { data, error } = await cloudClient
+      .from(CLOUD_CONFIG.cloudTable || "bixo_en_or_state")
+      .select("state")
+      .eq("id", CLOUD_CONFIG.stateId || "production")
+      .maybeSingle();
+    if (error) throw error;
+    if (data?.state) {
+      Object.assign(state, data.state);
+      normalizeState();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } else {
+      await saveCloudState();
+    }
+  } catch (error) {
+    state.loginError = `Falha ao sincronizar nuvem: ${error.message}`;
+  }
+  render();
+}
+
+async function saveCloudState() {
+  if (!CLOUD_ENABLED) return;
+  const payload = {
+    id: CLOUD_CONFIG.stateId || "production",
+    state,
+    updated_at: new Date().toISOString(),
+  };
+  try {
+    await cloudClient
+      .from(CLOUD_CONFIG.cloudTable || "bixo_en_or_state")
+      .upsert(payload, { onConflict: "id" });
+  } catch (error) {
+    state.loginError = `Falha ao salvar na nuvem: ${error.message}`;
   }
 }
 
@@ -428,6 +490,16 @@ function categories() {
   return ["Todos", ...Array.from(new Set(visibleChallenges().map((challenge) => challenge.category)))];
 }
 
+function editableCategories() {
+  return Array.from(new Set(allChallenges().map((challenge) => challenge.category))).sort((a, b) => a.localeCompare(b));
+}
+
+function renderCategoryOptions(selected = "") {
+  return editableCategories()
+    .map((category) => `<option value="${escapeAttr(category)}" ${category === selected ? "selected" : ""}>${escapeHtml(category)}</option>`)
+    .join("");
+}
+
 function filteredChallenges() {
   const query = state.query.trim().toLowerCase();
   return visibleChallenges().filter((challenge) => {
@@ -438,7 +510,7 @@ function filteredChallenges() {
       (state.status === "Todos" || (state.status === "Feitos" ? checked : !checked)) &&
       (!query || haystack.includes(query))
     );
-  });
+  }).sort((a, b) => Number(isCompleted(a.id, state.currentBixo)) - Number(isCompleted(b.id, state.currentBixo)));
 }
 
 function allChallenges() {
@@ -447,7 +519,7 @@ function allChallenges() {
     ...challenge,
     ...(state.challengeEdits[challenge.id] || {}),
   }));
-  return [...edited, ...state.customChallenges];
+  return [...edited, ...state.customChallenges].filter((challenge) => !state.deletedChallengeIds.includes(challenge.id));
 }
 
 function isSecretChallenge(challenge) {
@@ -458,9 +530,24 @@ function isSecretCategorySelected() {
   return state.category === "Bônus e Penalidades";
 }
 
+function categoryColor(category) {
+  const palette = ["#0e6f68", "#ba6b1f", "#3f5f91", "#a8404d", "#6b7c2f", "#8257a5", "#b0842a"];
+  const value = String(category || "Desafios");
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) hash = (hash + value.charCodeAt(i) * (i + 1)) % palette.length;
+  return palette[hash];
+}
+
+function categoryStyle(category) {
+  const color = categoryColor(category);
+  return `style="--category-color:${color}"`;
+}
+
 function visibleChallenges() {
   const challenges = allChallenges();
-  if (state.role === "Bixo") return challenges.filter((challenge) => !isSecretChallenge(challenge));
+  if (state.role === "Bixo") {
+    return challenges.filter((challenge) => !isSecretChallenge(challenge) && state.visibleCategories.includes(challenge.category));
+  }
   return challenges;
 }
 
@@ -757,6 +844,7 @@ function render(options = {}) {
         </div>
       </header>
       ${state.role === "Comissão" && state.showBixoManager ? renderBixoManager() : ""}
+      ${state.role === "Comissão" && state.showVisibilityManager ? renderVisibilityManager() : ""}
       <main class="main">
         <aside class="sidebar">
           ${state.role === "Comissão" ? renderCommissionSidebar(ranked) : renderBixoSidebar()}
@@ -782,7 +870,7 @@ function render(options = {}) {
               </select>
             </div>
           </div>
-          ${list.length ? `<div class="grid">${list.map(renderChallenge).join("")}</div>` : `<div class="empty">Nenhum défi encontrado para esse filtro.</div>`}
+          ${renderChallengeList(list)}
         </section>
       </main>
     </div>
@@ -790,6 +878,34 @@ function render(options = {}) {
 
   bindEvents();
   restoreFocus(options);
+}
+
+function renderChallengeList(list) {
+  if (!list.length) return `<div class="empty">Nenhum défi encontrado para esse filtro.</div>`;
+  if (!list.some(isVeteranChallenge)) {
+    return `<div class="grid">${list.map(renderChallenge).join("")}</div>`;
+  }
+
+  const groups = new Map();
+  list.forEach((challenge) => {
+    const key = isVeteranChallenge(challenge) ? challenge.owner || "Veteranos" : challenge.category;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(challenge);
+  });
+
+  return Array.from(groups.entries()).map(([owner, challenges]) => `
+    <section class="owner-group">
+      <div class="owner-heading">
+        <h2>${escapeHtml(owner)}</h2>
+        <span>${challenges.length} défis</span>
+      </div>
+      <div class="grid">${challenges.map(renderChallenge).join("")}</div>
+    </section>
+  `).join("");
+}
+
+function isVeteranChallenge(challenge) {
+  return /veteranos|voteranos|vets/i.test(challenge.category);
 }
 
 function renderCommissionOverview() {
@@ -890,7 +1006,9 @@ function renderAdminTools() {
         </div>
         <div class="field">
           <label for="new-category">Categoria</label>
-          <input id="new-category" required list="category-options" placeholder="Ex: FRANÇA">
+          <select id="new-category" required>
+            ${renderCategoryOptions("FRANÇA")}
+          </select>
         </div>
         <div class="field">
           <label for="new-owner">Vet / grupo</label>
@@ -898,7 +1016,7 @@ function renderAdminTools() {
         </div>
         <div class="field">
           <label for="new-points">Pontos base</label>
-          <input id="new-points" type="number" required value="10">
+          <input id="new-points" type="number" required min="-100" value="10">
         </div>
         <div class="field">
           <label for="new-description">Descrição</label>
@@ -908,9 +1026,6 @@ function renderAdminTools() {
       </form>
       <button class="danger" id="reset-data">Zerar validações</button>
     </section>
-    <datalist id="category-options">
-      ${categories().filter((category) => category !== "Todos").map((category) => `<option value="${escapeAttr(category)}"></option>`).join("")}
-    </datalist>
   `;
 }
 
@@ -939,7 +1054,35 @@ function renderCommissionSidebar(ranked) {
         `).join("")}
       </div>
       <button class="secondary full-button" id="open-bixo-manager">Gerenciar bixos</button>
+      <button class="secondary full-button" id="open-visibility-manager">Visibilidade bixos</button>
     </section>
+  `;
+}
+
+function renderVisibilityManager() {
+  const allCats = categories().filter((category) => category !== "Todos" && !isSecretChallenge({ category }));
+  return `
+    <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="visibility-title">
+      <section class="modal">
+        <div class="section-head">
+          <div>
+            <h2 id="visibility-title">Visibilidade bixos</h2>
+            <span class="muted">Selecione as categorias liberadas para os bixos.</span>
+          </div>
+          <button class="secondary icon-button" id="close-visibility-manager" aria-label="Fechar">×</button>
+        </div>
+        <form id="visibility-form" class="visibility-list">
+          ${allCats.map((category) => `
+            <label class="visibility-row" ${categoryStyle(category)}>
+              <input type="checkbox" name="category" value="${escapeAttr(category)}" ${state.visibleCategories.includes(category) ? "checked" : ""}>
+              <span class="category-dot"></span>
+              ${escapeHtml(category)}
+            </label>
+          `).join("")}
+          <button class="primary" type="submit">Salvar visibilidade</button>
+        </form>
+      </section>
+    </div>
   `;
 }
 
@@ -1008,7 +1151,7 @@ function renderChallenge(challenge) {
   return `
     <article class="challenge ${checked ? "done" : ""}">
       <div class="challenge-head">
-        <span class="tag">${escapeHtml(challenge.category)}${challenge.owner ? ` · ${escapeHtml(challenge.owner)}` : ""}</span>
+        <span class="tag" ${categoryStyle(challenge.category)}>${escapeHtml(challenge.category)}${challenge.owner ? ` · ${escapeHtml(challenge.owner)}` : ""}</span>
         <span class="points">${challenge.points > 0 ? "+" : ""}${challenge.points} pts${max !== null ? ` · max ${max}` : ""}</span>
       </div>
       <div>
@@ -1098,7 +1241,9 @@ function renderChallengeForm(challenge) {
         </div>
         <div class="field">
           <label for="edit-category-${challenge.id}">Categoria</label>
-          <input id="edit-category-${challenge.id}" name="category" required list="category-options" value="${escapeAttr(challenge.category)}">
+          <select id="edit-category-${challenge.id}" name="category" required>
+            ${renderCategoryOptions(challenge.category)}
+          </select>
         </div>
         <div class="field">
           <label for="edit-owner-${challenge.id}">Vet / grupo</label>
@@ -1106,7 +1251,7 @@ function renderChallengeForm(challenge) {
         </div>
         <div class="field">
           <label for="edit-points-${challenge.id}">Pontos base</label>
-          <input id="edit-points-${challenge.id}" name="points" type="number" required value="${challenge.points}">
+          <input id="edit-points-${challenge.id}" name="points" type="number" min="-100" required value="${challenge.points}">
         </div>
         <div class="field">
           <label for="edit-description-${challenge.id}">Descrição</label>
@@ -1114,6 +1259,7 @@ function renderChallengeForm(challenge) {
         </div>
         <div class="actions">
           <button class="primary" type="submit">Salvar</button>
+          <button class="danger" type="button" data-delete-challenge="${challenge.id}">Excluir défi</button>
           <button class="secondary" type="button" data-cancel-edit>Cancelar</button>
         </div>
       </form>
@@ -1151,6 +1297,18 @@ function bindEvents() {
     render();
   });
 
+  app.querySelector("#open-visibility-manager")?.addEventListener("click", () => {
+    state.showVisibilityManager = true;
+    saveState();
+    render();
+  });
+
+  app.querySelector("#close-visibility-manager")?.addEventListener("click", () => {
+    state.showVisibilityManager = false;
+    saveState();
+    render();
+  });
+
   app.querySelector("#close-bixo-manager")?.addEventListener("click", () => {
     state.showBixoManager = false;
     saveState();
@@ -1160,6 +1318,15 @@ function bindEvents() {
   app.querySelector(".modal-backdrop")?.addEventListener("click", (event) => {
     if (!event.target.classList.contains("modal-backdrop")) return;
     state.showBixoManager = false;
+    saveState();
+    render();
+  });
+
+  app.querySelector("#visibility-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    state.visibleCategories = data.getAll("category");
+    state.showVisibilityManager = false;
     saveState();
     render();
   });
@@ -1252,6 +1419,20 @@ function bindEvents() {
     });
   });
 
+  app.querySelectorAll("[data-delete-challenge]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.deleteChallenge;
+      const challenge = getChallenge(id);
+      if (!challenge || !confirm(`Excluir o défi "${challenge.title}"?`)) return;
+      state.deletedChallengeIds.push(id);
+      delete state.checks[id];
+      state.submissions = state.submissions.filter((submission) => submission.challengeId !== id);
+      state.editingChallengeId = "";
+      saveState();
+      render();
+    });
+  });
+
   app.querySelectorAll("[data-edit-form]").forEach((form) => {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1261,7 +1442,7 @@ function bindEvents() {
         title: data.get("title").trim(),
         category: data.get("category").trim(),
         owner: data.get("owner").trim(),
-        points: Number(data.get("points") || 0),
+        points: Math.max(-100, Number(data.get("points") || 0)),
         description: data.get("description").trim(),
       };
       const customIndex = state.customChallenges.findIndex((challenge) => challenge.id === id);
@@ -1300,7 +1481,7 @@ function bindEvents() {
     const title = app.querySelector("#new-title").value.trim();
     const category = app.querySelector("#new-category").value.trim();
     const owner = app.querySelector("#new-owner").value.trim();
-    const points = Number(app.querySelector("#new-points").value || 0);
+    const points = Math.max(-100, Number(app.querySelector("#new-points").value || 0));
     const description = app.querySelector("#new-description").value.trim();
     if (!title || !category) return;
 
@@ -1433,5 +1614,3 @@ function escapeHtml(value) {
 function escapeAttr(value) {
   return escapeHtml(value);
 }
-
-render();

@@ -375,10 +375,36 @@ button {
   min-height: 1.6rem;
   padding: 0 0.55rem;
   border-radius: 999px;
-  background: rgba(49, 94, 136, 0.12);
-  color: var(--blue);
+  background: color-mix(in srgb, var(--category-color, var(--blue)) 14%, transparent);
+  color: var(--category-color, var(--blue));
   font-size: 0.72rem;
   font-weight: 850;
+}
+
+.owner-group {
+  display: grid;
+  gap: 0.8rem;
+  margin-bottom: 1.2rem;
+}
+
+.owner-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.25rem 0.1rem;
+  border-bottom: 1px solid rgba(24, 33, 31, 0.1);
+}
+
+.owner-heading h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.owner-heading span {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 800;
 }
 
 .points {
@@ -682,6 +708,35 @@ button {
 .manager-actions {
   display: flex;
   gap: 0.45rem;
+}
+
+.visibility-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.visibility-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(24, 33, 31, 0.1);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-weight: 850;
+}
+
+.visibility-row input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--category-color, var(--green));
+}
+
+.category-dot {
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  background: var(--category-color, var(--green));
 }
 
 @media (max-width: 920px) {
